@@ -27,6 +27,8 @@ local ORIGIN_X = 4000
 local RELEASE_DELAY = 3 -- seconds a finished museum stays untouched while its thief is teleported out
 local LOAD_TIMEOUT = 6 -- longest the thief is held at the entry waiting for the client's HeistReady
 local CEILING_LIGHT_TAG = "HeistCeilingLight" -- the client pulses these during lockdown
+local STEAL_REACH = 14 -- server-side distance check for the Steal prompt (it activates at 9)
+local DIRECT_CHASE_RANGE = 18 -- lockdown guards run straight at a thief they can see this close
 
 local RED = Color3.fromRGB(255, 40, 55)
 local ALARM_RED = Color3.fromRGB(255, 30, 40)
@@ -48,6 +50,7 @@ local core
 local active = {} -- [player] = heist state
 local slots = {} -- [slot] = map occupying that slot (running, cooling down or pooled)
 local pool = {} -- [mapId] = { idle maps ready for reuse }
+local heistSerial = 0 -- makes every heist museum's name unique
 local activeFolder
 local rng = Random.new()
 
@@ -874,7 +877,17 @@ local function detect(state, dt, t)
 					end
 				end
 			end
-			g.Direct = state.Lockdown and inCone and los == true and distance < 18 or (state.Lockdown and flat < 8)
+			-- Lockdown: run straight at a thief in clear view (seen, or heard close by); anything behind a
+			-- wall or display case is chased along the grid path instead of through it.
+			g.Direct = false
+			if state.Lockdown and flat < DIRECT_CHASE_RANGE and (inCone or flat < 8) then
+				if los == nil then
+					los = hasLineOfSight(state, eye, pos)
+				end
+				g.Direct = los
+			end
+		elseif g.Direct then
+			g.Direct = false
 		end
 	end
 
@@ -1058,6 +1071,23 @@ local function sendHome(player)
 	end
 end
 
+-- sendHome without yielding, keeping the player Busy until they're home so a new heist can't start
+-- (and be undone by this teleport) while it is still streaming.
+local function returnHome(player, profile)
+	if profile then
+		profile.Session.Busy = true
+	end
+	task.spawn(function()
+		local ok, err = pcall(sendHome, player)
+		if not ok then
+			warn("[RelicRNG] Heist send-home failed: " .. tostring(err))
+		end
+		if profile and not active[player] then
+			profile.Session.Busy = false
+		end
+	end)
+end
+
 -- Undoes what startHeist changed on the player: the loading hold, camera occlusion/zoom, museum streaming.
 local function restorePlayer(state)
 	local player = state.Player
@@ -1186,12 +1216,15 @@ function finish(state, success, reason)
 	end
 	table.clear(state.Connections)
 
+	if not success and not state.Arrived and (reason == "KnockedOut" or reason == "Abandoned") then
+		-- The clock never started (still teleporting in or loading): refund instead of punishing.
+		reason = "Cancelled"
+	end
 	local info = Tuning.Maps[state.MapId]
 	local elapsed = state.Arrived and t - state.StartedAt or 0
 	local summary = { Success = success, Reason = reason, MapId = state.MapId, MapName = info.Name, Time = elapsed }
 	local profile = core.GetProfile(player)
 	if profile then
-		profile.Session.Busy = false
 		local data = profile.Data
 		local h = heistData(data)
 		if success then
@@ -1218,8 +1251,8 @@ function finish(state, success, reason)
 				core.FireAllClients("Heist", "Announce", { Name = player.DisplayName, MapName = info.Name, RelicId = relicId, Tier = tier })
 			end
 		elseif reason == "Cancelled" then
-			-- Couldn't get the thief inside (no character): refund, no penalty.
-			h.Energy += 1
+			-- Never got going (no character, or knocked out / quit before the clock started): refund, no penalty.
+			h.Energy = math.min(h.Energy + 1, energyCap(player))
 			summary.NotorietyLost = 0
 		else
 			local loss = math.min(h.Notoriety, info.FailNotoriety)
@@ -1237,13 +1270,17 @@ function finish(state, success, reason)
 	restorePlayer(state)
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local goingHome = false
 	if humanoid and humanoid.Health > 0 then
 		humanoid.WalkSpeed = state.BaseWalkSpeed
 		-- Only once the thief is actually inside; startHeist sends them home itself if the teleport in
 		-- finishes after the heist already ended.
-		if state.Teleported and reason ~= "Left" and reason ~= "KnockedOut" then
-			task.spawn(sendHome, player)
-		end
+		goingHome = state.Teleported and reason ~= "Left" and reason ~= "KnockedOut"
+	end
+	if goingHome then
+		returnHome(player, profile)
+	elseif profile then
+		profile.Session.Busy = false
 	end
 	-- Leave the museum alone for a moment while the thief is teleported out, then pool it.
 	local map = state.Map
@@ -1289,6 +1326,9 @@ local function startHeist(player, mapId)
 	if profile.Session.Busy then
 		return false, "Finish what you're doing first."
 	end
+	if profile.Session.ThiefActive then
+		return false, "A thief is robbing your museum! Deal with them first."
+	end
 	local data = profile.Data
 	if data.Level < info.Level then
 		return false, ("%s needs Curator Level %d."):format(info.Name, info.Level)
@@ -1316,7 +1356,10 @@ local function startHeist(player, mapId)
 		warn("[RelicRNG] Heist map failed to build: " .. tostring(map))
 		return false, "That museum is closed right now."
 	end
-	map.Model.Name = ("%s_%d"):format(mapId, player.UserId)
+	-- Unique per heist: a museum from a heist that just ended keeps its name until it is pooled, and the
+	-- client finds this one by name.
+	heistSerial += 1
+	map.Model.Name = ("%s_%d_%d"):format(mapId, player.UserId, heistSerial)
 	map.Target.Prompt.HoldDuration = Tuning.StealSeconds
 	map.Target.Prompt.Enabled = true
 
@@ -1346,8 +1389,13 @@ local function startHeist(player, mapId)
 	-- Steal: only the heist owner, only after the full hold (timed here, not trusted from the client),
 	-- and never sooner than walking from the entry could get them there.
 	local prompt = map.Target.Prompt
+	local function nearTarget(who)
+		local r = who.Character and who.Character:FindFirstChild("HumanoidRootPart")
+		return r ~= nil and (r.Position - map.Target.Position).Magnitude <= STEAL_REACH
+	end
 	table.insert(state.Connections, prompt.PromptButtonHoldBegan:Connect(function(who)
-		if who == player then
+		-- A hold only counts from when the thief is actually at the case (no pre-starting it on the way).
+		if who == player and state.Arrived and nearTarget(who) then
 			state.HoldBeganAt = os.clock()
 		end
 	end))
@@ -1357,11 +1405,7 @@ local function startHeist(player, mapId)
 		end
 	end))
 	table.insert(state.Connections, prompt.Triggered:Connect(function(who)
-		if who ~= player or state.Done or state.Stolen or not state.Arrived then
-			return
-		end
-		local r = who.Character and who.Character:FindFirstChild("HumanoidRootPart")
-		if not r or (r.Position - map.Target.Position).Magnitude > 14 then
+		if who ~= player or state.Done or state.Stolen or not state.Arrived or not nearTarget(who) then
 			return
 		end
 		local began = state.HoldBeganAt
@@ -1421,7 +1465,7 @@ local function startHeist(player, mapId)
 	if state.Done then
 		-- Abandoned / died / left while streaming: undo the teleport if it went through anyway.
 		if arrived then
-			task.spawn(sendHome, player)
+			returnHome(player, profile)
 		end
 		return false
 	end
