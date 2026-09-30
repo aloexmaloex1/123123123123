@@ -50,6 +50,7 @@ local core
 local active = {} -- [player] = heist state
 local slots = {} -- [slot] = map occupying that slot (running, cooling down or pooled)
 local pool = {} -- [mapId] = { idle maps ready for reuse }
+local heistSerial = 0 -- makes every heist museum's name unique
 local activeFolder
 local rng = Random.new()
 
@@ -1070,6 +1071,23 @@ local function sendHome(player)
 	end
 end
 
+-- sendHome without yielding, keeping the player Busy until they're home so a new heist can't start
+-- (and be undone by this teleport) while it is still streaming.
+local function returnHome(player, profile)
+	if profile then
+		profile.Session.Busy = true
+	end
+	task.spawn(function()
+		local ok, err = pcall(sendHome, player)
+		if not ok then
+			warn("[RelicRNG] Heist send-home failed: " .. tostring(err))
+		end
+		if profile and not active[player] then
+			profile.Session.Busy = false
+		end
+	end)
+end
+
 -- Undoes what startHeist changed on the player: the loading hold, camera occlusion/zoom, museum streaming.
 local function restorePlayer(state)
 	local player = state.Player
@@ -1198,12 +1216,15 @@ function finish(state, success, reason)
 	end
 	table.clear(state.Connections)
 
+	if not success and not state.Arrived and (reason == "KnockedOut" or reason == "Abandoned") then
+		-- The clock never started (still teleporting in or loading): refund instead of punishing.
+		reason = "Cancelled"
+	end
 	local info = Tuning.Maps[state.MapId]
 	local elapsed = state.Arrived and t - state.StartedAt or 0
 	local summary = { Success = success, Reason = reason, MapId = state.MapId, MapName = info.Name, Time = elapsed }
 	local profile = core.GetProfile(player)
 	if profile then
-		profile.Session.Busy = false
 		local data = profile.Data
 		local h = heistData(data)
 		if success then
@@ -1230,7 +1251,7 @@ function finish(state, success, reason)
 				core.FireAllClients("Heist", "Announce", { Name = player.DisplayName, MapName = info.Name, RelicId = relicId, Tier = tier })
 			end
 		elseif reason == "Cancelled" then
-			-- Couldn't get the thief inside (no character): refund, no penalty.
+			-- Never got going (no character, or knocked out / quit before the clock started): refund, no penalty.
 			h.Energy = math.min(h.Energy + 1, energyCap(player))
 			summary.NotorietyLost = 0
 		else
@@ -1249,13 +1270,17 @@ function finish(state, success, reason)
 	restorePlayer(state)
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local goingHome = false
 	if humanoid and humanoid.Health > 0 then
 		humanoid.WalkSpeed = state.BaseWalkSpeed
 		-- Only once the thief is actually inside; startHeist sends them home itself if the teleport in
 		-- finishes after the heist already ended.
-		if state.Teleported and reason ~= "Left" and reason ~= "KnockedOut" then
-			task.spawn(sendHome, player)
-		end
+		goingHome = state.Teleported and reason ~= "Left" and reason ~= "KnockedOut"
+	end
+	if goingHome then
+		returnHome(player, profile)
+	elseif profile then
+		profile.Session.Busy = false
 	end
 	-- Leave the museum alone for a moment while the thief is teleported out, then pool it.
 	local map = state.Map
@@ -1301,6 +1326,9 @@ local function startHeist(player, mapId)
 	if profile.Session.Busy then
 		return false, "Finish what you're doing first."
 	end
+	if profile.Session.ThiefActive then
+		return false, "A thief is robbing your museum! Deal with them first."
+	end
 	local data = profile.Data
 	if data.Level < info.Level then
 		return false, ("%s needs Curator Level %d."):format(info.Name, info.Level)
@@ -1328,7 +1356,10 @@ local function startHeist(player, mapId)
 		warn("[RelicRNG] Heist map failed to build: " .. tostring(map))
 		return false, "That museum is closed right now."
 	end
-	map.Model.Name = ("%s_%d"):format(mapId, player.UserId)
+	-- Unique per heist: a museum from a heist that just ended keeps its name until it is pooled, and the
+	-- client finds this one by name.
+	heistSerial += 1
+	map.Model.Name = ("%s_%d_%d"):format(mapId, player.UserId, heistSerial)
 	map.Target.Prompt.HoldDuration = Tuning.StealSeconds
 	map.Target.Prompt.Enabled = true
 
@@ -1434,7 +1465,7 @@ local function startHeist(player, mapId)
 	if state.Done then
 		-- Abandoned / died / left while streaming: undo the teleport if it went through anyway.
 		if arrived then
-			task.spawn(sendHome, player)
+			returnHome(player, profile)
 		end
 		return false
 	end

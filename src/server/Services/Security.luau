@@ -23,6 +23,7 @@ local CATCH_WINDOW = THIEF.CatchSeconds -- seconds between the alarm and the out
 local BUSY_GRACE = 90 -- no thief for this long after a heist / busy period ends
 local CATCH_HOLD = 1 -- seconds to hold the Catch prompt
 local CATCH_REACH = 16 -- server-side distance check for the Catch prompt
+local CATCH_HOLD_SLACK = 0.25 -- network jitter allowed on the server-timed hold
 -- Loss cap for an escaped thief: at most this many minutes of income AND this share of coins.
 local MAX_STOLEN_MINUTES = math.min(THIEF.StolenIncomeMinutes, 10)
 local MAX_STOLEN_FRACTION = math.min(THIEF.MaxStolenFraction, 0.05)
@@ -135,9 +136,28 @@ function Security.Init(core)
 		local standWorld = (frame * CFrame.new(standAt)).Position
 
 		local caughtByPlayer = false
+		local holdBegan, holdEnded = nil, nil
 		local point, prompt = makeCatchPoint(player, plot, standWorld)
+		-- The hold is timed here, not trusted from the client (same as the heist steal). Destroying the
+		-- point in cleanupAttempt disconnects these too.
+		prompt.PromptButtonHoldBegan:Connect(function(who)
+			if who == player then
+				holdBegan = os.clock()
+			end
+		end)
+		prompt.PromptButtonHoldEnded:Connect(function(who)
+			if who == player then
+				holdEnded = os.clock()
+			end
+		end)
 		local connection = prompt.Triggered:Connect(function(who)
 			if who ~= player or caughtByPlayer then
+				return
+			end
+			local began = holdBegan
+			holdBegan = nil
+			local heldUntil = (holdEnded and began and holdEnded > began) and holdEnded or os.clock()
+			if not began or heldUntil - began < CATCH_HOLD - CATCH_HOLD_SLACK then
 				return
 			end
 			local root = who.Character and who.Character:FindFirstChild("HumanoidRootPart")

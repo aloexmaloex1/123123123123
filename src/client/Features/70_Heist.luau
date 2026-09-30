@@ -291,6 +291,7 @@ return function(ctx)
 		table.insert(edges, edge)
 	end
 	local flashAlpha = 0
+	local flashColor = RED
 	local function setVignette(alpha, color)
 		for _, edge in ipairs(edges) do
 			edge.BackgroundTransparency = 1 - math.clamp(alpha, 0, 1)
@@ -615,8 +616,9 @@ return function(ctx)
 		end
 	end)
 
-	local function flash(strength)
+	local function flash(strength, color)
 		flashAlpha = math.max(flashAlpha, strength)
+		flashColor = color or RED
 	end
 
 	local function showSummary(s)
@@ -792,10 +794,7 @@ return function(ctx)
 		elseif event == "ToolUsed" then
 			if payload.Tool == "EMP" then
 				empBurst(payload.Pos)
-				setVignette(0.5, BLUE)
-				task.delay(0.35, function()
-					setVignette(0, RED)
-				end)
+				flash(0.5, BLUE)
 			end
 		elseif event == "End" then
 			endHeist(payload)
@@ -858,7 +857,8 @@ return function(ctx)
 			-- Vignette: fades after each detection flash, pulses during lockdown.
 			flashAlpha = math.max(0, flashAlpha - dt * 1.4)
 			local base = heist.Lockdown and (0.28 + pulse * 0.25) or (heist.Seen and 0.22 or 0)
-			setVignette(math.max(base, flashAlpha))
+			-- The flash keeps its own colour (blue for an EMP) until it fades under the red base.
+			setVignette(math.max(base, flashAlpha), flashAlpha > base and flashColor or RED)
 			if heist.Lockdown then
 				lockdownTitle.TextTransparency = 0.15 * pulse
 				lockdownSub.Text = ("The guards are hunting you. EXIT in %s!"):format(clock(left))
