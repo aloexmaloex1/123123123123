@@ -33,6 +33,8 @@ From then on edit files, not Studio scripts — Rojo overwrites Studio scripts f
 
 - Unit tests (Studio, Edit mode, command bar):
   `print(require(game.ServerScriptService.RelicRNG.Tests.TestRunner).run())`
+- Unit tests without Studio (terminal or CI, from the repo root): `lune run tests/run`
+  (`tests/run.luau` rebuilds the Rojo tree from `default.project.json` and runs the same specs).
 - QA: in Studio (or as the place creator in a live server) the **Dev** menu button opens cheat
   tools (coins, levels, pity, thieves, heist energy, profile reset). The server re-checks access.
 - Format: `stylua src` · Lint: `selene src`
