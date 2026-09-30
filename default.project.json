@@ -1,0 +1,23 @@
+{
+  "name": "RelicRNG",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "RelicRNG": {
+        "$path": "src/shared"
+      }
+    },
+    "ServerScriptService": {
+      "RelicRNG": {
+        "$path": "src/server"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "RelicRNGClient": {
+          "$path": "src/client"
+        }
+      }
+    }
+  }
+}
