@@ -482,8 +482,12 @@ return function(ctx)
 
 	---------------------------------------------------------------- announcements
 
-	local banner = panel({ Name = "Announcement", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 122), Size = UDim2.new(0, 580, 0, 46), Visible = false, ZIndex = 15, Parent = gui })
+	-- Scale width capped at 580 px so long announcements fit on phones; pops in and shrinks away.
+	local banner = panel({ Name = "Announcement", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 122), Size = UDim2.new(0.94, 0, 0, 46), Visible = false, ZIndex = 15, Parent = gui })
+	new("UISizeConstraint", { MaxSize = Vector2.new(580, 46), Parent = banner })
+	local bannerScale = new("UIScale", { Parent = banner })
 	local bannerText = label({ Size = UDim2.new(1, -24, 1, -10), Position = UDim2.new(0, 12, 0, 4), Font = Theme.FontBlack, Text = "", TextStrokeTransparency = 0.4, ZIndex = 15, Parent = banner }, 20)
+	local bannerStroke = banner:FindFirstChildOfClass("UIStroke")
 	local bannerToken = 0
 
 	function ctx.ShowBanner(text, color, seconds)
@@ -491,10 +495,16 @@ return function(ctx)
 		local token = bannerToken
 		bannerText.Text = text
 		bannerText.TextColor3 = color or Theme.Gold
-		local s = banner:FindFirstChildOfClass("UIStroke")
-		s.Color, s.Thickness, s.Transparency = color or Theme.Gold, 2, 0.1
+		bannerStroke.Color, bannerStroke.Thickness, bannerStroke.Transparency = color or Theme.Gold, 2, 0.1
 		banner.Visible = true
+		bannerScale.Scale = 0.82
+		ctx.tween(bannerScale, ctx.Anim.Pop, { Scale = 1 })
 		task.delay(seconds or 6, function()
+			if bannerToken ~= token then
+				return
+			end
+			ctx.tween(bannerScale, ctx.Anim.Close, { Scale = 0.85 })
+			task.wait(ctx.Anim.Close.Time)
 			if bannerToken == token then
 				banner.Visible = false
 			end
