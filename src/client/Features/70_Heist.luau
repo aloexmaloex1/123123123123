@@ -1,6 +1,10 @@
 -- Heists: the NPC museum heist menu (museums, energy, notoriety, tool shop) and the in-heist HUD:
 -- timer, alarm meter, objective, tool bar (keys 1-5), detection flashes, lockdown banner and results.
 -- The server (Services.Heist) runs the heist; this only draws what it's told via "Heist" events.
+-- Guards and camera heads exist on the server only as numbers: they are built and animated here,
+-- locally, from the Start / State payloads (FeatureConfig.Heist has the model builders). Once the
+-- museum has streamed in this sends HeistReady so the server lets the thief go.
+local CollectionService = game:GetService("CollectionService")
 local Lighting = game:GetService("Lighting")
 local RunService = game:GetService("RunService")
 local StarterGui = game:GetService("StarterGui")
@@ -32,6 +36,7 @@ return function(ctx)
 		KnockedOut = "KNOCKED OUT",
 		Abandoned = "HEIST ABANDONED",
 		Left = "HEIST FAILED",
+		Cancelled = "HEIST CANCELLED",
 	}
 	local FAIL_LINES = {
 		Caught = "A guard caught you red-handed.",
@@ -39,6 +44,7 @@ return function(ctx)
 		KnockedOut = "You went down inside the museum.",
 		Abandoned = "You slipped out empty-handed.",
 		Left = "You left the museum.",
+		Cancelled = "Couldn't get you inside. Your energy was refunded.",
 	}
 
 	local function serverNow()
@@ -299,6 +305,10 @@ return function(ctx)
 	local lockdownTitle = label({ Size = UDim2.new(1, 0, 0, 60), Text = "LOCKDOWN", Font = Theme.FontBlack, TextColor3 = RED, TextStrokeTransparency = 0, TextStrokeColor3 = Color3.fromRGB(40, 0, 0), ZIndex = 12, Parent = lockdownBanner }, 56)
 	local lockdownSub = label({ Position = UDim2.new(0, 0, 0, 62), Size = UDim2.new(1, 0, 0, 26), Text = "The guards are hunting you. Run for the EXIT!", Font = Theme.FontBold, TextStrokeTransparency = 0.2, ZIndex = 12, Parent = lockdownBanner }, 20)
 
+	-- "SNEAKING IN..." while the museum streams in and the thief is held at the door, then "GO!".
+	local readyLabel = label({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.34), Size = UDim2.new(0.8, 0, 0, 64), Text = "", Font = Theme.FontBlack, TextColor3 = Theme.GoldLight, TextStrokeTransparency = 0.15, TextStrokeColor3 = Color3.fromRGB(30, 20, 5), Visible = false, ZIndex = 12, Parent = gui }, 52)
+	local readyScale = new("UIScale", { Parent = readyLabel })
+
 	local function refreshScale()
 		local width = gui.AbsoluteSize.X
 		local s = math.clamp(width / 1100, 0.62, 1)
@@ -316,6 +326,209 @@ return function(ctx)
 	local heist -- current heist info from the server, nil when not in one
 	local mood
 	local hidden = {}
+	local heistToken = 0 -- bumps on every Start / End so stale waits and delays can tell they're stale
+
+	---------------------------------------------------------------- world visuals (local only)
+
+	local Sec = Tuning.Security
+	local CEILING_LIGHT_TAG = "HeistCeilingLight"
+	local STATE_INTERVAL = 1 / Sec.TickRate -- guards glide from one State sample to the next over one tick
+	local FLASHLIGHT_PITCH = math.rad(-10)
+	local LED_DARK = Color3.fromRGB(70, 12, 16)
+	local EMP_DIM = Tuning.EmpBlue:Lerp(Color3.new(0, 0, 0), 0.45)
+	local BEAM_CALM = NumberSequence.new(0.72, 0.93)
+	local BEAM_WATCHING = NumberSequence.new(0.4, 0.78)
+
+	local fx -- workspace folder with this heist's guard and camera-head models
+	local guards = {} -- [i] = { Parts, From, To, FromYaw, ToYaw, At, Moving, Range }
+	local cams = {} -- [i] = { Parts, Pos, BaseYaw, Pitch, Phase, Mode }
+	local watching = {} -- [camera index] = true while that camera can see the thief (reused every frame)
+	local litCeiling = {} -- [SpotLight] = brightness before the lockdown pulse
+	local beamParams = RaycastParams.new()
+	beamParams.FilterType = Enum.RaycastFilterType.Include
+	beamParams.FilterDescendantsInstances = {}
+
+	local function angleLerp(a, b, t)
+		local diff = (b - a + math.pi) % (2 * math.pi) - math.pi
+		return a + diff * t
+	end
+
+	local function clearWorld()
+		for _, guard in ipairs(guards) do
+			guard.Parts.End:Destroy()
+		end
+		for _, cam in ipairs(cams) do
+			cam.Parts.End:Destroy()
+		end
+		table.clear(guards)
+		table.clear(cams)
+		if fx then
+			fx:Destroy()
+			fx = nil
+		end
+		-- The server never changes these brightnesses, so put them back here, or the next heist in this
+		-- pooled museum would start with the lights stuck mid-pulse.
+		for light, brightness in pairs(litCeiling) do
+			if light.Parent then
+				light.Brightness = brightness
+			end
+		end
+		table.clear(litCeiling)
+		beamParams.FilterDescendantsInstances = {}
+	end
+
+	local function buildWorld(cameras)
+		clearWorld()
+		fx = new("Folder", { Name = "HeistClientFx", Parent = workspace })
+		for i, cam in ipairs(type(cameras) == "table" and cameras or {}) do
+			local parts = Tuning.BuildCameraHead(fx, Tuning.CameraCFrame(cam.Pos, cam.BaseYaw, cam.Pitch), workspace.Terrain)
+			cams[i] = { Parts = parts, Pos = cam.Pos, BaseYaw = cam.BaseYaw, Pitch = cam.Pitch, Phase = cam.Phase }
+		end
+	end
+
+	-- G packs every guard as x, z, yaw, look. Guards are built on first sight and glide between samples.
+	local function syncGuards(g)
+		if not fx or type(g) ~= "table" then
+			return
+		end
+		local now = os.clock()
+		local floorY = heist.FloorY or 0
+		for i = 1, #g // 4 do
+			local x, z, yaw, look = g[i * 4 - 3], g[i * 4 - 2], g[i * 4 - 1], g[i * 4]
+			local target = Vector3.new(x, floorY, z)
+			local guard = guards[i]
+			if not guard then
+				guard = { Parts = Tuning.BuildGuardModel(fx, target, workspace.Terrain), From = target, To = target, FromYaw = yaw, ToYaw = yaw, At = now }
+				guards[i] = guard
+			else
+				local alpha = math.clamp((now - guard.At) / STATE_INTERVAL, 0, 1)
+				guard.From = guard.From:Lerp(guard.To, alpha)
+				guard.FromYaw = angleLerp(guard.FromYaw, guard.ToYaw, alpha)
+				guard.To, guard.ToYaw, guard.At = target, yaw, now
+			end
+			guard.Moving = (guard.To - guard.From).Magnitude > 0.05
+			Tuning.SetGuardLook(guard.Parts, look)
+		end
+	end
+
+	-- Remembers the ceiling lights of this museum so the lockdown can pulse them (and End restore them).
+	local function collectCeilingLights()
+		if not heist or not heist.Model or next(litCeiling) then
+			return
+		end
+		for _, panel in ipairs(CollectionService:GetTagged(CEILING_LIGHT_TAG)) do
+			local light = panel:IsDescendantOf(heist.Model) and panel:FindFirstChildOfClass("SpotLight")
+			if light then
+				litCeiling[light] = light.Brightness
+			end
+		end
+	end
+
+	-- Moves guards, flashlight beams (as long as the guard's real sight range) and sweeping cameras.
+	local function animateWorld(t)
+		if not fx then
+			return
+		end
+		local now = os.clock()
+		local range = (heist.ShoesUntil or 0) > t and Sec.SilentRange or Sec.GuardRange
+		for i, guard in ipairs(guards) do
+			local alpha = math.clamp((now - guard.At) / STATE_INTERVAL, 0, 1)
+			local pos = guard.From:Lerp(guard.To, alpha)
+			local facing = CFrame.Angles(0, angleLerp(guard.FromYaw, guard.ToYaw, alpha), 0)
+			local stride = guard.Moving and math.sin(now * 9 + i) or 0
+			local root = CFrame.new(pos.X, pos.Y + 3 + math.abs(stride) * 0.18, pos.Z) * facing * CFrame.Angles(0, 0, stride * 0.05)
+			local parts = guard.Parts
+			parts.Root.CFrame = root
+			if guard.Range ~= range then
+				guard.Range = range
+				parts.Light.Range = range
+			end
+			if parts.Beam.Enabled then
+				local origin = (root * CFrame.new(1.45, 1.35, -2.5)).Position
+				local reach = (facing * CFrame.Angles(FLASHLIGHT_PITCH, 0, 0)).LookVector * range
+				local hit = workspace:Raycast(origin, reach, beamParams)
+				parts.End.WorldPosition = hit and hit.Position or origin + reach
+			end
+		end
+
+		local elapsed = heist.Go and t - heist.StartedAt or 0
+		local emp = (heist.EmpUntil or 0) > t
+		table.clear(watching)
+		for _, index in ipairs(type(heist.CS) == "table" and heist.CS or {}) do
+			watching[index] = true
+		end
+		for i, cam in ipairs(cams) do
+			local parts = cam.Parts
+			local cf = Tuning.CameraCFrame(cam.Pos, Tuning.CameraYaw(cam.BaseYaw, cam.Phase, elapsed), cam.Pitch)
+			parts.Pivot.CFrame = cf
+			local mode = emp and "Emp" or (watching[i] and "Watching" or "Calm")
+			if cam.Mode ~= mode then
+				cam.Mode = mode
+				parts.Light.Enabled = mode ~= "Emp"
+				parts.Beam.Enabled = mode ~= "Emp"
+				parts.Beam.Transparency = mode == "Watching" and BEAM_WATCHING or BEAM_CALM
+				parts.Lens.Color = mode == "Emp" and EMP_DIM or Tuning.CameraRed
+			end
+			if mode ~= "Emp" then
+				local reach = cf.LookVector * Sec.CameraRange
+				local hit = workspace:Raycast(cf.Position, reach, beamParams)
+				parts.End.WorldPosition = hit and hit.Position or cf.Position + reach
+			end
+			-- LED: a slow blink while sweeping, a fast strobe while it can see you, off during an EMP.
+			local lit = (mode == "Watching" and now % 0.2 < 0.1) or (mode == "Calm" and now % 1.2 < 0.15)
+			parts.Led.Color = mode == "Emp" and EMP_DIM or (lit and Tuning.CameraRed or LED_DARK)
+		end
+
+		if heist.Lockdown then
+			collectCeilingLights()
+			local pulse = 0.5 + 0.5 * math.sin(now * 7)
+			for light in pairs(litCeiling) do
+				light.Brightness = 0.6 + pulse * 4
+			end
+		end
+	end
+
+	local function empBurst(pos)
+		if not fx or typeof(pos) ~= "Vector3" then
+			return
+		end
+		local ball = new("Part", { Name = "EmpBurst", Shape = Enum.PartType.Ball, Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, CastShadow = false, Material = Enum.Material.ForceField, Color = BLUE, Parent = fx })
+		ball.Size = Vector3.one * 3
+		ball.Position = pos
+		local glow = new("PointLight", { Color = BLUE, Range = 40, Brightness = 6, Parent = ball })
+		local info = TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(ball, info, { Size = Vector3.one * 70, Transparency = 1 }):Play()
+		TweenService:Create(glow, info, { Brightness = 0 }):Play()
+		task.delay(0.8, ball.Destroy, ball)
+	end
+
+	-- Waits for the museum to stream in (floor plus every wall), then tells the server we're ready.
+	-- The server starts anyway after its own timeout, so this never blocks a heist.
+	local function reportReady(token, modelName)
+		local deadline = os.clock() + 10
+		local root = workspace:WaitForChild("RelicRNG", 10)
+		local folder = root and root:WaitForChild("ActiveHeists", 10)
+		local model
+		while folder and os.clock() < deadline and heistToken == token do
+			local candidate = folder:FindFirstChild(modelName)
+			local solid = candidate and candidate:FindFirstChild("Solid")
+			if solid and candidate:FindFirstChild("Floor") and #solid:GetChildren() >= (candidate:GetAttribute("SolidCount") or 0) then
+				model = candidate
+				break
+			end
+			task.wait(0.1)
+		end
+		if heistToken ~= token then
+			return
+		end
+		if model then
+			heist.Model = model
+			beamParams.FilterDescendantsInstances = { model.Solid, model.Floor }
+		end
+		pcall(function()
+			ctx.Remotes.Action:InvokeServer("HeistReady")
+		end)
+	end
 
 	local function setWorldHud(inHeist)
 		local rollPanel = gui:FindFirstChild("RollPanel")
@@ -434,9 +647,12 @@ return function(ctx)
 			if relic then
 				table.insert(rows, { ("Loot: %s (%s)"):format(relic.Name, Config.Rarities[s.Tier].Name), Config.Rarities[s.Tier].Color })
 			end
+		elseif s.Reason == "Cancelled" then
+			table.insert(rows, { "No notoriety lost and no cooldown.", Theme.Muted })
 		else
 			table.insert(rows, { ("-%d Notoriety"):format(s.NotorietyLost or 0), RED })
-			table.insert(rows, { ("Lie low for %ds before your next heist."):format(Tuning.FailCooldown), Theme.Muted })
+			local wait = s.CooldownUntil and math.ceil(s.CooldownUntil - serverNow()) or Tuning.FailCooldown
+			table.insert(rows, { ("Lie low for %ds before your next heist."):format(math.max(wait, 0)), Theme.Muted })
 		end
 		local _, rank = Tuning.GetRank(s.Notoriety or 0)
 		table.insert(rows, { ("Rank: %s  ·  %s notoriety"):format(rank.Name, fmt(s.Notoriety or 0)), rank.Color })
@@ -455,6 +671,9 @@ return function(ctx)
 
 	local function endHeist(summary)
 		heist = nil
+		heistToken += 1
+		clearWorld()
+		readyLabel.Visible = false
 		hud.Visible = false
 		toolbar.Visible = false
 		vignette.Visible = false
@@ -473,13 +692,30 @@ return function(ctx)
 		for key, value in pairs(payload) do
 			heist[key] = value
 		end
+		heist.CS = payload.CS -- nil when no camera sees you, so it must be cleared explicitly
+		syncGuards(payload.G)
 		refreshTools()
 	end
 
 	ctx.OnEvent("Heist", function(event, payload)
 		payload = payload or {}
 		if event == "Start" then
-			heist = { MapId = payload.MapId, EndsAt = payload.EndsAt, Alarm = 0, Stolen = false, Lockdown = false, EmpUntil = 0, ShoesUntil = 0 }
+			heistToken += 1
+			heist = {
+				MapId = payload.MapId,
+				EndsAt = payload.EndsAt,
+				StartedAt = payload.StartedAt or serverNow(),
+				Duration = payload.Duration or Tuning.Duration,
+				FloorY = payload.FloorY or 0,
+				Go = false,
+				Alarm = 0,
+				Stolen = false,
+				Lockdown = false,
+				EmpUntil = 0,
+				ShoesUntil = 0,
+			}
+			buildWorld(payload.Cameras)
+			task.spawn(reportReady, heistToken, payload.ModelName)
 			ctx.closeModals()
 			local old = gui:FindFirstChild("HeistSummary")
 			if old then
@@ -494,7 +730,37 @@ return function(ctx)
 			setMood(payload.MapId)
 			setWorldHud(true)
 			refreshTools()
-			ctx.ShowBanner(("Steal %s and escape!"):format(payload.TargetName or "the relic"), Tuning.Maps[payload.MapId] and Tuning.Maps[payload.MapId].Color, 4)
+			heist.TargetName = payload.TargetName or "the relic"
+			readyLabel.Text = "SNEAKING IN..."
+			readyLabel.TextColor3 = Theme.GoldLight
+			readyLabel.TextTransparency = 0
+			readyLabel.TextStrokeTransparency = 0.15
+			readyScale.Scale = 1
+			readyLabel.Visible = true
+		elseif event == "Go" then
+			if not heist then
+				return
+			end
+			heist.Go = true
+			heist.StartedAt = payload.StartedAt or serverNow()
+			heist.EndsAt = payload.EndsAt or heist.EndsAt
+			local token = heistToken
+			readyLabel.Text = "GO!"
+			readyLabel.TextColor3 = GREEN
+			readyLabel.Visible = true
+			readyScale.Scale = 1.6
+			TweenService:Create(readyScale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+			task.delay(0.7, function()
+				if heistToken == token then
+					TweenService:Create(readyLabel, TweenInfo.new(0.3), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+				end
+			end)
+			task.delay(1.05, function()
+				if heistToken == token then
+					readyLabel.Visible = false
+				end
+			end)
+			ctx.ShowBanner(("Steal %s and escape!"):format(heist.TargetName or "the relic"), Tuning.Maps[heist.MapId] and Tuning.Maps[heist.MapId].Color, 4)
 		elseif event == "State" then
 			applyState(payload)
 		elseif event == "Detected" then
@@ -516,6 +782,7 @@ return function(ctx)
 				heist.Lockdown = true
 				heist.EndsAt = payload.EndsAt or heist.EndsAt
 			end
+			collectCeilingLights()
 			lockdownBanner.Visible = true
 			lockdownBanner.Size = UDim2.new(0, 780, 0, 138)
 			TweenService:Create(lockdownBanner, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = UDim2.new(0, 520, 0, 92) }):Play()
@@ -524,6 +791,7 @@ return function(ctx)
 			end
 		elseif event == "ToolUsed" then
 			if payload.Tool == "EMP" then
+				empBurst(payload.Pos)
 				setVignette(0.5, BLUE)
 				task.delay(0.35, function()
 					setVignette(0, RED)
@@ -553,7 +821,8 @@ return function(ctx)
 	RunService.RenderStepped:Connect(function(dt)
 		local t = serverNow()
 		if heist then
-			local left = (heist.EndsAt or t) - t
+			animateWorld(t)
+			local left = heist.Go and (heist.EndsAt or t) - t or heist.Duration
 			timerLabel.Text = clock(left)
 			timerLabel.TextColor3 = left <= 30 and (t % 0.5 < 0.25 and RED or Theme.Text) or Theme.Text
 			local alarm = math.clamp(heist.Alarm or 0, 0, 100)
@@ -568,7 +837,7 @@ return function(ctx)
 			local pulse = (math.sin(t * (heist.Lockdown and 12 or 8)) + 1) / 2
 			alarmBarStroke.Transparency = danger and (0.6 - pulse * 0.6) or 1
 			alarmTitle.TextColor3 = danger and RED or Theme.Muted
-			objective.Text = heist.Stolen and "ESCAPE! Reach the green EXIT" or "Find the relic and hold E"
+			objective.Text = not heist.Go and "Get ready..." or (heist.Stolen and "ESCAPE! Reach the green EXIT" or "Find the relic and hold E")
 			objective.TextColor3 = heist.Stolen and GREEN or Theme.GoldLight
 			local bits = {}
 			if (heist.EmpUntil or 0) > t then

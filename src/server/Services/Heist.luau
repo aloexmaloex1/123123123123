@@ -27,6 +27,8 @@ local ORIGIN_X = 4000
 local RELEASE_DELAY = 3 -- seconds a finished museum stays untouched while its thief is teleported out
 local LOAD_TIMEOUT = 6 -- longest the thief is held at the entry waiting for the client's HeistReady
 local CEILING_LIGHT_TAG = "HeistCeilingLight" -- the client pulses these during lockdown
+local STEAL_REACH = 14 -- server-side distance check for the Steal prompt (it activates at 9)
+local DIRECT_CHASE_RANGE = 18 -- lockdown guards run straight at a thief they can see this close
 
 local RED = Color3.fromRGB(255, 40, 55)
 local ALARM_RED = Color3.fromRGB(255, 30, 40)
@@ -874,7 +876,17 @@ local function detect(state, dt, t)
 					end
 				end
 			end
-			g.Direct = state.Lockdown and inCone and los == true and distance < 18 or (state.Lockdown and flat < 8)
+			-- Lockdown: run straight at a thief in clear view (seen, or heard close by); anything behind a
+			-- wall or display case is chased along the grid path instead of through it.
+			g.Direct = false
+			if state.Lockdown and flat < DIRECT_CHASE_RANGE and (inCone or flat < 8) then
+				if los == nil then
+					los = hasLineOfSight(state, eye, pos)
+				end
+				g.Direct = los
+			end
+		elseif g.Direct then
+			g.Direct = false
 		end
 	end
 
@@ -1219,7 +1231,7 @@ function finish(state, success, reason)
 			end
 		elseif reason == "Cancelled" then
 			-- Couldn't get the thief inside (no character): refund, no penalty.
-			h.Energy += 1
+			h.Energy = math.min(h.Energy + 1, energyCap(player))
 			summary.NotorietyLost = 0
 		else
 			local loss = math.min(h.Notoriety, info.FailNotoriety)
@@ -1346,8 +1358,13 @@ local function startHeist(player, mapId)
 	-- Steal: only the heist owner, only after the full hold (timed here, not trusted from the client),
 	-- and never sooner than walking from the entry could get them there.
 	local prompt = map.Target.Prompt
+	local function nearTarget(who)
+		local r = who.Character and who.Character:FindFirstChild("HumanoidRootPart")
+		return r ~= nil and (r.Position - map.Target.Position).Magnitude <= STEAL_REACH
+	end
 	table.insert(state.Connections, prompt.PromptButtonHoldBegan:Connect(function(who)
-		if who == player then
+		-- A hold only counts from when the thief is actually at the case (no pre-starting it on the way).
+		if who == player and state.Arrived and nearTarget(who) then
 			state.HoldBeganAt = os.clock()
 		end
 	end))
@@ -1357,11 +1374,7 @@ local function startHeist(player, mapId)
 		end
 	end))
 	table.insert(state.Connections, prompt.Triggered:Connect(function(who)
-		if who ~= player or state.Done or state.Stolen or not state.Arrived then
-			return
-		end
-		local r = who.Character and who.Character:FindFirstChild("HumanoidRootPart")
-		if not r or (r.Position - map.Target.Position).Magnitude > 14 then
+		if who ~= player or state.Done or state.Stolen or not state.Arrived or not nearTarget(who) then
 			return
 		end
 		local began = state.HoldBeganAt

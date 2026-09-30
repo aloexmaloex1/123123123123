@@ -5,8 +5,9 @@
 --
 -- Thief attempts: the owner gets an alert and CATCH_WINDOW seconds to reach the thief at the robbed
 -- pedestal and hold E on the server-side "Catch" prompt (a guaranteed catch). If they don't, the
--- Security Level catch chance decides. The thief NPC, its run and the alarm beacons are drawn by every
--- client from "Security" "ThiefFx" events (Features.60_Museum), so nothing is tweened on the server.
+-- Security Level catch chance decides. The thief NPC (rope drop, work, caught / escape) is drawn by every
+-- client from "Security" "ThiefFx" events (Features.60_Museum), so nothing is tweened on the server; the
+-- plot's alarm beacons flash for the whole attempt.
 -- No attempts while the player is busy / in a heist, nor for BUSY_GRACE seconds afterwards.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -18,7 +19,7 @@ local Security = {}
 local random = Random.new()
 local THIEF = Tuning.Thief
 
-local CATCH_WINDOW = 18 -- seconds between the alarm and the outcome
+local CATCH_WINDOW = THIEF.CatchSeconds -- seconds between the alarm and the outcome
 local BUSY_GRACE = 90 -- no thief for this long after a heist / busy period ends
 local CATCH_HOLD = 1 -- seconds to hold the Catch prompt
 local CATCH_REACH = 16 -- server-side distance check for the Catch prompt
@@ -90,6 +91,7 @@ function Security.Init(core)
 			attempts[player] = nil
 			attempt.Connection:Disconnect()
 			attempt.Point:Destroy()
+			MuseumService.SetAlarm(player, false)
 		end
 	end
 
@@ -144,11 +146,13 @@ function Security.Init(core)
 			end
 		end)
 		attempts[player] = { Point = point, Connection = connection }
+		MuseumService.SetAlarm(player, true)
 
 		local startLevel = data.Security.Level
 		local endsAt = workspace:GetServerTimeNow() + CATCH_WINDOW
 		core.FireClient(player, "Security", "Thief", {
 			Phase = "Alert",
+			Id = id,
 			Seconds = CATCH_WINDOW,
 			EndsAt = endsAt,
 			Level = startLevel,
@@ -159,6 +163,7 @@ function Security.Init(core)
 			Phase = "Enter",
 			Id = id,
 			Owner = player.UserId,
+			OwnerName = player.DisplayName,
 			Plot = plot.Name,
 			Frame = frame,
 			Target = target,
@@ -185,20 +190,18 @@ function Security.Init(core)
 			core.AddCredits(player, credits)
 			data.Security.Caught += 1
 			entry.Credits = credits
-			local how = caughtByPlayer and "You caught the thief red-handed!" or "Your security caught the thief!"
-			core.Notify(player, ("%s +%d Security Credits"):format(how, credits), "success")
 		else
 			local stolen = Security.StolenAmount(core.GetIncomePerMinute(player, data), data.Coins)
 			core.AddCoins(player, -stolen)
 			data.Security.Escaped += 1
 			entry.Coins = stolen
-			core.Notify(player, ("The thief escaped with %s coins! Upgrade your Security to catch the next one."):format(Config.FormatNumber(stolen)), "error")
 		end
 		local log = data.Security.Log
 		table.insert(log, 1, entry)
 		while #log > THIEF.LogSize do
 			table.remove(log)
 		end
+		-- The owner's client shows the outcome (banner + flash) from this; no separate toast.
 		core.FireClient(player, "Security", "Thief", {
 			Phase = "Result",
 			Caught = caught,
